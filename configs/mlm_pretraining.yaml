@@ -1,0 +1,30 @@
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  fp_bits: 4096
+  fp_encoder_layers: 2
+  cross_attn_every_n: 2
+  max_seq_len: 256
+  dropout: 0.1
+
+data:
+  preprocessed_dir: "data/pretrain_100m"
+  max_len: 256
+  formula_grouped: true
+
+training:
+  safe_gpt_path: "checkpoints/safe_gpt_base"
+  batch_size: 64
+  gradient_accumulation_steps: 2
+  max_epochs: 2
+  lr: 3e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  max_grad_norm: 1.0
+  num_workers: 0
+  log_interval: 100
+  save_interval: 20000
+  output_dir: "checkpoints/mlm"
+  wandb_project: "ms-gpt"
+  run_name: "conditional-mlm-100m-formula-grouped"

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ms-gpt"
+version = "1.0.0"
+description = "MS-GPT: Rethinking MS/MS De Novo Structure Elucidation as Spectrum-Induced Posterior Querying of a Molecule-Language Model"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0,<5.0.0",
+    "peft>=0.10.0",
+    "safe-mol>=0.1.13",
+    "datamol",
+    "datasets>=2.18.0",
+    "rdkit",
+    "numpy>=1.26.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "omegaconf>=2.3.0",
+    "tqdm",
+    "matplotlib>=3.7.0",
+    "wandb>=0.13.0",
+]
+
+[project.optional-dependencies]
+# Required only for the MCES structural metric in
+# scripts/evaluate_structural_metrics.py. Canonical candidate ranking in
+# scripts/rank_candidates.py does not require these packages.
+metrics = ["myopic-mces", "pulp"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ms_gpt*"]

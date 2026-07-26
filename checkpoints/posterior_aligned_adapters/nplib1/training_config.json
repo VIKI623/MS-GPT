@@ -1,0 +1,23 @@
+{
+  "mlm_checkpoint": "checkpoints/mlm/ms_gpt_mlm.pt",
+  "mlm_config": "configs/mlm_pretraining.yaml",
+  "benchmark": "nplib1",
+  "training_split": "train",
+  "threshold_low": 0.062,
+  "threshold_high": 0.292,
+  "recoverability_groups": {
+    "frozen_hit": {"ce_weight": 0.05, "kl_weight": 2.0},
+    "residual": {"ce_weight": 1.0, "kl_weight": 1.0},
+    "low_coverage": {"ce_weight": 0.0, "kl_weight": 0.5}
+  },
+  "rank": 4,
+  "alpha": 8.0,
+  "dropout": 0.05,
+  "batch_size_per_gpu": 8,
+  "max_steps": 3000,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.01,
+  "warmup_steps": 150,
+  "selected_step": 3000,
+  "seed": 42
+}

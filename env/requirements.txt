@@ -1,0 +1,22 @@
+# MS-GPT runtime dependencies.
+# Tested with Python 3.10 + CUDA 12.x: A6000 Ada for inference, A800 for training.
+# Install torch matching your CUDA build first (https://pytorch.org), then `pip install -r env/requirements.txt`.
+
+torch>=2.2.0
+transformers>=4.40.0,<5.0.0
+peft>=0.10.0            # posterior-aligned LoRA adapters
+safe-mol>=0.1.13       # SAFE molecular string tokenizer (datamol-io/safe-gpt vocab)
+datamol                # chemistry helpers
+datasets>=2.18.0       # HF datasets (SAFE-GPT pretraining corpus streaming)
+rdkit                  # fingerprints, InChIKey, formula
+numpy>=1.26.0
+pandas>=2.0.0
+pyarrow>=14.0.0        # posterior-cache parquet I/O
+omegaconf>=2.3.0       # config loading
+tqdm
+matplotlib>=3.7.0      # density-band figures
+wandb>=0.13.0          # optional training logging
+
+# --- optional: MCES metric in scripts/evaluate_structural_metrics.py ---
+# myopic-mces
+# pulp
