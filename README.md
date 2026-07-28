@@ -93,7 +93,8 @@ PyTorch build separately if the host has a different CUDA version.
 
 ### 2. Place the released assets
 
-Download the released asset bundle from Zenodo (**download link to be added**)
+Download the released asset bundle from the
+[SJTU Cloud](https://pan.sjtu.edu.cn/web/share/8f63823e4d82280636e537d1c789128d)
 and extract it into the repository root:
 
 ```text
@@ -137,3 +138,17 @@ sbatch scripts/launch/evaluate_mces.slurm \
 ## License
 
 The code is released under the [Apache License 2.0](LICENSE).
+
+## Citation
+
+```bibtex
+@misc{zhao2026msgptrethinkingmsmsnovo,
+      title={MS-GPT: Rethinking MS/MS De Novo Structure Elucidation as Spectrum-Induced Posterior Querying of a Molecule-Language Model},
+      author={Xin Zhao and Yumin Liu and Zhuo Li and Weichu Zheng and Feng Zhu and Xiaokang Yang and Yaohui Jin and Yanyan Xu},
+      year={2026},
+      eprint={2607.23607},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2607.23607},
+}
+```
