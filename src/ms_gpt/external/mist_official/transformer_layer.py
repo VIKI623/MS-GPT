@@ -4,14 +4,13 @@ Hold pairwise attention enabled transformers
 
 """
 import math
-from typing import Optional, Union, Callable, Tuple
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
+from torch.nn import Dropout, LayerNorm, Linear, Module, Parameter
 from torch.nn import functional as F
-from torch.nn import Module, LayerNorm, Linear, Dropout, Parameter
-from torch.nn.init import xavier_uniform_, constant_
-
+from torch.nn.init import constant_, xavier_uniform_
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 
 
@@ -48,7 +47,7 @@ class TransformerEncoderLayer(Module):
         >>> src = torch.rand(32, 10, 512)
         >>> out = encoder_layer(src)
     """
-    __constants__ = ["batch_first", "norm_first"]
+    __constants__ = ("batch_first", "norm_first")
 
     def __init__(
         self,
@@ -56,7 +55,7 @@ class TransformerEncoderLayer(Module):
         nhead: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+        activation: str | Callable[[Tensor], Tensor] = F.relu,
         layer_norm_eps: float = 1e-5,
         batch_first: bool = False,
         norm_first: bool = False,
@@ -66,7 +65,7 @@ class TransformerEncoderLayer(Module):
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(TransformerEncoderLayer, self).__init__()
+        super().__init__()
         self.pairwise_featurization = pairwise_featurization
         self.self_attn = MultiheadAttention(
             d_model,
@@ -93,13 +92,13 @@ class TransformerEncoderLayer(Module):
     def __setstate__(self, state):
         if "activation" not in state:
             state["activation"] = F.relu
-        super(TransformerEncoderLayer, self).__setstate__(state)
+        super().__setstate__(state)
 
     def forward(
         self,
         src: Tensor,
-        pairwise_features: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
+        pairwise_features: Tensor | None = None,
+        src_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -132,8 +131,8 @@ class TransformerEncoderLayer(Module):
     def _sa_block(
         self,
         x: Tensor,
-        pairwise_features: Optional[Tensor],
-        key_padding_mask: Optional[Tensor],
+        pairwise_features: Tensor | None,
+        key_padding_mask: Tensor | None,
     ) -> Tensor:
 
         ## Apply joint featurizer
@@ -194,7 +193,7 @@ class MultiheadAttention(Module):
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(MultiheadAttention, self).__init__()
+        super().__init__()
 
         self.embed_dim = embed_dim
         self.kdim = embed_dim
@@ -272,9 +271,9 @@ class MultiheadAttention(Module):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        key_padding_mask: Optional[Tensor] = None,
-        pairwise_features: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+        key_padding_mask: Tensor | None = None,
+        pairwise_features: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
         r"""
         Args:
             query: Query embeddings of shape :math:`(L, E_q)` for unbatched input, :math:`(L, N, E_q)` when ``batch_first=False``
@@ -347,14 +346,14 @@ class MultiheadAttention(Module):
         embed_dim_to_check: int,
         num_heads: int,
         in_proj_weight: Tensor,
-        in_proj_bias: Optional[Tensor],
+        in_proj_bias: Tensor | None,
         dropout_p: float,
         out_proj_weight: Tensor,
-        out_proj_bias: Optional[Tensor],
+        out_proj_bias: Tensor | None,
         training: bool = True,
-        key_padding_mask: Optional[Tensor] = None,
-        pairwise_features: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+        key_padding_mask: Tensor | None = None,
+        pairwise_features: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
         r"""
         Args:
             query, key, value: map a query and a set of key-value pairs to an output.
@@ -484,10 +483,10 @@ class MultiheadAttention(Module):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        attn_mask: Optional[Tensor] = None,
+        attn_mask: Tensor | None = None,
         dropout_p: float = 0.0,
-        pairwise_features: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        pairwise_features: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """_additive_attn.
 
         Args:
@@ -559,7 +558,7 @@ class MultiheadAttention(Module):
         if attn_mask is not None:
             new_attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
             new_attn_mask.masked_fill_(attn_mask, float("-inf"))
-            attn += attn_mask
+            attn += new_attn_mask
         attn = F.softmax(attn, dim=-1)
         output = torch.bmm(attn, v)
         return output, attn
@@ -569,10 +568,10 @@ class MultiheadAttention(Module):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        attn_mask: Optional[Tensor] = None,
+        attn_mask: Tensor | None = None,
         dropout_p: float = 0.0,
-        pairwise_features: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        pairwise_features: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         r"""
         Computes scaled dot product attention on query, key and value tensors, using
         an optional attention mask if passed, and applying dropout if a probability
@@ -597,7 +596,7 @@ class MultiheadAttention(Module):
             - Output: attention values have shape :math:`(B, Nt, E)`; attention weights
                 have shape :math:`(B, Nt, Ns)`
         """
-        B, Nt, E = q.shape
+        _B, Nt, E = q.shape
         q = q / math.sqrt(E)
 
         if self.pairwise_featurization:
@@ -630,7 +629,7 @@ class MultiheadAttention(Module):
         if attn_mask is not None:
             new_attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
             new_attn_mask.masked_fill_(attn_mask, float("-inf"))
-            attn += attn_mask
+            attn += new_attn_mask
 
         attn = F.softmax(attn, dim=-1)
         if dropout_p > 0.0:

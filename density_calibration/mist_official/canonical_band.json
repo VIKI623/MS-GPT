@@ -1,0 +1,60 @@
+{
+  "density_ratio_band": [
+    0.85,
+    1.25
+  ],
+  "benchmarks": {
+    "nplib1": {
+      "calibration_split": "train",
+      "training_rows": 6810,
+      "true_density_D": 47.065932452276066,
+      "threshold_low": 0.0009432522660051203,
+      "threshold_high": 0.9552834148694076,
+      "density_match_threshold": 0.012708699342579906,
+      "theta_by_kappa": {
+        "0.85": 0.9552834148694076,
+        "1.0": 0.012708699342579906,
+        "1.25": 0.0009432522660051203
+      },
+      "validation_rows": 401,
+      "validation_f1_threshold": 0.414000004529953,
+      "validation_cosine_threshold": 0.5189999938011169,
+      "validation_f1": 0.7174075549450619,
+      "validation_cosine": 0.7222713965659232,
+      "point_selection": {
+        "split": "val",
+        "aggregation": "mean_per_spectrum",
+        "grid_step": 0.001,
+        "tie_break": "smallest_threshold"
+      },
+      "max_fragment_peaks": 10,
+      "cache_dir": "data/posterior_cache/mist_official/annotated_top10"
+    },
+    "massspecgym": {
+      "calibration_split": "train",
+      "training_rows": 194119,
+      "true_density_D": 42.27098841432317,
+      "threshold_low": 0.03112947114434112,
+      "threshold_high": 0.7947460954389134,
+      "density_match_threshold": 0.14261944544985794,
+      "theta_by_kappa": {
+        "0.85": 0.7947460954389134,
+        "1.0": 0.14261944544985794,
+        "1.25": 0.03112947114434112
+      },
+      "validation_rows": 19429,
+      "validation_f1_threshold": 0.3019999861717224,
+      "validation_cosine_threshold": 0.42399999499320984,
+      "validation_f1": 0.5738578040507338,
+      "validation_cosine": 0.5796277768556698,
+      "point_selection": {
+        "split": "val",
+        "aggregation": "mean_per_spectrum",
+        "grid_step": 0.001,
+        "tie_break": "smallest_threshold"
+      },
+      "max_fragment_peaks": 10,
+      "cache_dir": "data/posterior_cache/mist_official/annotated_top10"
+    }
+  }
+}

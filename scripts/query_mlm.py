@@ -4,25 +4,20 @@ For each spectrum in the cache:
   1. Read π_raw (and metadata) directly — no online MIST encoding.
   2. Construct the density-calibrated binary query band.
   3. Generate candidates from the conditional MLM for every query.
-  4. Write one JSONL row per spectrum.
+  4. Save the raw SAFE sequences in one JSONL row per spectrum.
 
 The point-query method is retained for the paper's ablation.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python scripts/query_mlm.py \\
-        --cache_dir data/posterior_cache --benchmark massspecgym \\
+        --inference_config checkpoints/posterior_aligned_adapters/ms_gpt_mlm/mist_official/massspecgym/inference_config.json \\
         --split test \\
-        --mlm_checkpoint checkpoints/mlm/ms_gpt_mlm.pt \\
-        --mlm_config configs/mlm_pretraining.yaml \\
-        --query_method density_calibrated_band \\
-        --num_queries 20 --samples_per_query 5 \\
-        --threshold_low 0.069 --threshold_high 0.274 \\
-        --start_idx 0 --end_idx 2195 \\
-        --output eval_results/massspecgym_shard0.jsonl
+        --output eval_results/massspecgym_base.jsonl
 """
 import argparse
 import json
 import os
+from pathlib import Path
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -35,21 +30,11 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 RDLogger.DisableLog("rdApp.*")
 
-from safe.tokenizer import SAFETokenizer
-import safe as sf
-
 from ms_gpt.models.conditional_mlm import (
     ConditionalMoleculeLanguageModel, normalize_mlm_checkpoint_state_dict,
 )
-from ms_gpt.data.mlm_pretraining_dataset import formula_str_to_vec
-from ms_gpt.data.posterior_queries import construct_queries
-
-
-def load_molecule_tokenizer():
-    model_path = os.environ.get("MS_GPT_SAFE_GPT_CKPT", "checkpoints/safe_gpt_base")
-    tk = SAFETokenizer.from_pretrained(model_path).get_pretrained()
-    tk.add_tokens(["<", ">"])
-    return tk
+from ms_gpt.data.mlm_pretraining_dataset import ELEMENTS, formula_str_to_vec, load_molecule_tokenizer
+from ms_gpt.data.posterior_queries import BAND_POINTS, construct_queries, resolve_threshold_band
 
 
 def decode_tokens(tokenizer, token_ids, eos_id):
@@ -58,26 +43,22 @@ def decode_tokens(tokenizer, token_ids, eos_id):
         if t == eos_id:
             break
         tokens.append(int(t))
-    text = tokenizer.decode(tokens, skip_special_tokens=True)
-    try:
-        smi = sf.decode(text)
-        if smi:
-            return smi
-    except Exception:
-        pass
-    return text
+    return tokenizer.decode(tokens, skip_special_tokens=True)
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", required=True)
-    parser.add_argument("--benchmark", choices=("massspecgym", "nplib1"), required=True)
+    parser.add_argument("--inference_config", help="Adapter inference_config.json; explicit arguments override it.")
+    parser.add_argument("--calibration_file", help="Canonical JSON supplying this benchmark's band endpoints.")
+    parser.add_argument("--cache_dir")
+    parser.add_argument("--benchmark", choices=("massspecgym", "nplib1"))
     parser.add_argument("--split", choices=("train", "val", "test"), required=True)
-    parser.add_argument("--mlm_checkpoint", required=True)
-    parser.add_argument("--mlm_config", required=True)
+    parser.add_argument("--mlm_checkpoint")
+    parser.add_argument("--mlm_config")
+    parser.add_argument("--tokenizer_path", help="Tokenizer paired with the decoder; defaults to its model config.")
     parser.add_argument("--query_method", choices=("point", "density_calibrated_band"),
                         default="density_calibrated_band")
-    parser.add_argument("--num_queries", type=int, default=20)
+    parser.add_argument("--num_queries", type=int, default=BAND_POINTS)
     parser.add_argument("--samples_per_query", type=int, default=5)
     parser.add_argument("--threshold", type=float, default=None,
                         help="Binarization threshold for the point-query ablation "
@@ -107,11 +88,51 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--inference_config")
+    config_parser.add_argument("--cache_dir")
+    config_args, _ = config_parser.parse_known_args()
+    if config_args.inference_config:
+        profile = json.loads(Path(config_args.inference_config).read_text())
+        # Adapter application is explicit so the same profile also serves Base.
+        fields = {action.dest for action in parser._actions} - {"adapter_checkpoint"}
+        parser.set_defaults(**{key: value for key, value in profile.items() if key in fields})
     args = parser.parse_args()
-
+    for field in ("benchmark", "mlm_checkpoint", "mlm_config"):
+        if getattr(args, field) is None:
+            parser.error(f"Supply --{field} or --inference_config")
+    if args.calibration_file:
+        calibration_path = Path(args.calibration_file)
+        if calibration_path.is_file():
+            calibration = json.loads(calibration_path.read_text())["benchmarks"][args.benchmark]
+            if config_args.cache_dir is None:
+                args.cache_dir = calibration["cache_dir"]
+            if args.threshold_low is None:
+                args.threshold_low = calibration["threshold_low"]
+            if args.threshold_high is None:
+                args.threshold_high = calibration["threshold_high"]
+        elif args.query_method == "density_calibrated_band" and (
+            args.threshold_low is None or args.threshold_high is None
+        ):
+            parser.error(f"Run density calibration first: {calibration_path}")
+    if args.cache_dir is None:
+        parser.error("Supply --cache_dir, --calibration_file or --inference_config")
     if args.query_method == "point":
         args.num_queries = 1
+        if args.threshold is None or not 0 <= args.threshold <= 1:
+            parser.error("Point queries require --threshold in [0, 1]")
+    else:
+        try:
+            resolve_threshold_band(args.threshold_low, args.threshold_high)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if min(args.batch_size, args.num_queries, args.samples_per_query) < 1:
+        parser.error("Batch size, query count and samples per query must be positive")
+    return args
 
+
+def main():
+    args = parse_args()
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -129,39 +150,34 @@ def main():
     assert pi.shape[0] == n_total, f"cache mismatch: meta {n_total} vs pi {pi.shape[0]}"
 
     # Optional: restrict generation to a saved subset of cache rows. start/end
-    # then index into the subset array (so 8-shard sharding works over the subset).
+    # then index into that subset rather than the complete cache.
     if args.keep_indices_file:
         base = np.load(args.keep_indices_file).astype(np.int64)
-        end = args.end_idx if args.end_idx else len(base)
+        if base.ndim != 1 or (base < 0).any() or (base >= n_total).any():
+            raise ValueError("Subset indices must refer to rows in the selected posterior cache")
+        end = args.end_idx if args.end_idx is not None else len(base)
+        if not 0 <= args.start_idx <= end <= len(base):
+            raise ValueError("Requested range lies outside the subset")
         indices = base[args.start_idx:end]
         print(f"Subset {args.keep_indices_file}: {len(base)} rows; "
               f"this shard [{args.start_idx}:{end}] = {len(indices)} spectra")
     else:
-        end = args.end_idx if args.end_idx else n_total
+        end = args.end_idx if args.end_idx is not None else n_total
+        if not 0 <= args.start_idx <= end <= n_total:
+            raise ValueError("Requested range lies outside the posterior cache")
         indices = np.arange(args.start_idx, end)
         print(f"Generating for cache rows [{args.start_idx}:{end}] = {len(indices)} spectra")
-    print(f"Query method: {args.query_method}; total candidates/spectrum="
-          f"{args.num_queries * args.samples_per_query}")
+    draws_per_spectrum = args.num_queries * args.samples_per_query
+    print(f"Query method: {args.query_method}; total candidates/spectrum={draws_per_spectrum}")
 
     # --- Load conditional MLM ---
     cfg = OmegaConf.load(args.mlm_config)
-    tokenizer = load_molecule_tokenizer()
-    vocab_size = len(tokenizer)
+    tokenizer = load_molecule_tokenizer(args.tokenizer_path or cfg.get("tokenizer_path"))
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
 
     print(f"Loading conditional MLM: {args.mlm_checkpoint}")
-    model = ConditionalMoleculeLanguageModel(
-        vocab_size=vocab_size,
-        d_model=cfg.model.d_model,
-        n_layers=cfg.model.n_layers,
-        n_heads=cfg.model.n_heads,
-        fp_bits=cfg.model.fp_bits,
-        fp_encoder_layers=cfg.model.fp_encoder_layers,
-        cross_attn_every_n=cfg.model.cross_attn_every_n,
-        max_seq_len=cfg.model.max_seq_len,
-        dropout=0.0,
-    )
+    model = ConditionalMoleculeLanguageModel.from_config(cfg, len(tokenizer), dropout=0.0)
     sd = torch.load(args.mlm_checkpoint, map_location="cpu", weights_only=True)
     # Pretrain ckpt was saved with nn.MultiheadAttention; convert to split-QKV.
     sd = normalize_mlm_checkpoint_state_dict(sd)
@@ -184,19 +200,16 @@ def main():
 
     # --- Generation loop ---
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    fout = open(args.output, "w")
     n_written = 0
-    try:
+    with open(args.output, "w") as fout:
         for batch_start in tqdm(range(0, len(indices), args.batch_size)):
             batch_idx = indices[batch_start:batch_start + args.batch_size]
-            if len(batch_idx) == 0:
-                continue
 
             # Stack all queries for this spectrum batch.
             fp_stack = np.empty(
                 (len(batch_idx) * args.num_queries, cfg.model.fp_bits), dtype=np.float32
             )
-            fv_stack = np.empty((len(batch_idx) * args.num_queries, 14), dtype=np.float32)
+            fv_stack = np.empty((len(batch_idx) * args.num_queries, len(ELEMENTS)), dtype=np.float32)
             meta_rows = []
             for j, ridx in enumerate(batch_idx):
                 pi_i = np.asarray(pi[ridx], dtype=np.float32)
@@ -216,7 +229,8 @@ def main():
             fp_t = torch.tensor(fp_stack, dtype=torch.float32, device=device)
             fv_t = torch.tensor(fv_stack, dtype=torch.float32, device=device)
 
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16,
+                                                 enabled=device.type == "cuda"):
                 gen_ids = model.generate(
                     fingerprint=fp_t, formula_vec=fv_t,
                     max_len=cfg.model.max_seq_len,
@@ -226,15 +240,10 @@ def main():
                     num_samples=args.samples_per_query,
                 )
             # Generated rows are ordered by spectrum, query, then sample.
+            generated_tokens = gen_ids.cpu().tolist()
             for j, row in enumerate(meta_rows):
-                smis = []
-                for q in range(args.num_queries):
-                    for c in range(args.samples_per_query):
-                        row_idx = (
-                            j * args.num_queries + q
-                        ) * args.samples_per_query + c
-                        ids = gen_ids[row_idx].cpu().tolist()
-                        smis.append(decode_tokens(tokenizer, ids, eos_id))
+                tokens = generated_tokens[j * draws_per_spectrum:(j + 1) * draws_per_spectrum]
+                sequences = [decode_tokens(tokenizer, ids, eos_id) for ids in tokens]
 
                 fout.write(json.dumps({
                     "cache_row": int(batch_idx[j]),
@@ -244,14 +253,11 @@ def main():
                     "query_method": args.query_method,
                     "num_queries": int(args.num_queries),
                     "samples_per_query": int(args.samples_per_query),
-                    "candidate_smiles": smis,
+                    "candidate_safe": sequences,
                 }) + "\n")
                 n_written += 1
             if (batch_start + args.batch_size) % 200 == 0:
                 fout.flush()
-    finally:
-        fout.close()
-
     print(f"\nDone: wrote {n_written} rows → {args.output}")
 
 

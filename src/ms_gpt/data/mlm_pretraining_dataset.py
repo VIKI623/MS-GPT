@@ -1,17 +1,19 @@
 """
 Datasets for conditional molecule-language model pretraining.
 
-Two modes:
+Input formats:
 1. PreprocessedMLMDataset — memory-mapped Arrow IPC + numpy (fast, multi-worker safe)
-2. StreamingMLMDataset — on-the-fly from HuggingFace (slow, single-worker fallback)
+2. TokenizedMLMDataset — saved token sequences, fingerprints and formulas in Parquet
+3. StreamingMLMDataset — on-the-fly from HuggingFace (slow, single-worker fallback)
 """
 
+import os
 import pickle
 import re
 from collections import defaultdict
 from pathlib import Path
 from glob import glob
-from typing import Dict, Optional
+from typing import Optional
 
 import numpy as np
 import pyarrow as pa
@@ -21,6 +23,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 import safe as sf
+from safe.tokenizer import SAFETokenizer
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
@@ -28,6 +31,14 @@ ELEMENTS = [
     "C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I",
     "B", "Si", "Se", "As",
 ]
+
+
+def load_molecule_tokenizer(path=None):
+    """Load the decoder-paired SAFE tokenizer with formula delimiter tokens."""
+    path = path or os.environ.get("MS_GPT_SAFE_GPT_CKPT", "checkpoints/safe_gpt_base")
+    tokenizer = SAFETokenizer.from_pretrained(path).get_pretrained()
+    tokenizer.add_tokens(["<", ">"])
+    return tokenizer
 
 
 def smiles_to_fingerprint(smiles: str, n_bits: int = 4096, radius: int = 2) -> Optional[np.ndarray]:
@@ -69,11 +80,11 @@ def smiles_to_safe(smiles: str) -> Optional[str]:
 
 
 class PreprocessedMLMDataset(Dataset):
-    """Memory-mapped dataset from preprocessed parquet shards.
+    """Memory-mapped dataset rooted at a pretraining corpus directory.
 
-    On first load, converts parquet shards to:
-      - data.arrow: Arrow IPC (smiles + fp_indices as uint16), memory-mapped
-      - formula_vecs.npy: [N, 14] float32, numpy memory-mapped
+    On first load, converts train/shard_*.parquet to:
+      - train/data.arrow: Arrow IPC (smiles + fp_indices as uint16), memory-mapped
+      - train/formula_vecs.npy: [N, 14] float32, numpy memory-mapped
       - formula_groups.pkl: {formula_str: [indices]}, for FormulaGroupBatchSampler
 
     All processes share mmap pages — safe with num_workers > 0 and DDP.
@@ -85,8 +96,9 @@ class PreprocessedMLMDataset(Dataset):
         self.fp_bits = fp_bits
 
         parquet_dir = Path(parquet_dir)
-        arrow_path = parquet_dir / "data.arrow"
-        fvec_path = parquet_dir / "formula_vecs.npy"
+        train_dir = parquet_dir / "train"
+        arrow_path = train_dir / "data.arrow"
+        fvec_path = train_dir / "formula_vecs.npy"
         groups_path = parquet_dir / "formula_groups.pkl"
 
         if not arrow_path.exists():
@@ -112,12 +124,17 @@ class PreprocessedMLMDataset(Dataset):
     def convert(parquet_dir):
         """One-time: parquet shards → Arrow IPC + numpy mmap + formula groups."""
         parquet_dir = Path(parquet_dir)
-        parquet_files = sorted(glob(str(parquet_dir / "shard_*.parquet")))
+        train_dir = parquet_dir / "train"
+        parquet_files = sorted(glob(str(train_dir / "shard_*.parquet")))
         if not parquet_files:
-            raise FileNotFoundError(f"No shard_*.parquet in {parquet_dir}")
+            raise FileNotFoundError(f"No shard_*.parquet in {train_dir}")
+        if "input_ids" in pq.read_schema(parquet_files[0]).names:
+            raise ValueError(
+                "This corpus contains pretokenized targets; load its input_ids directly."
+            )
 
-        arrow_path = parquet_dir / "data.arrow"
-        fvec_path = parquet_dir / "formula_vecs.npy"
+        arrow_path = train_dir / "data.arrow"
+        fvec_path = train_dir / "formula_vecs.npy"
         groups_path = parquet_dir / "formula_groups.pkl"
 
         print(f"Converting {len(parquet_files)} shards → Arrow IPC ...")
@@ -216,6 +233,60 @@ class PreprocessedMLMDataset(Dataset):
             "attention_mask": attention_mask,
             "fingerprint": fp,
             "formula_vec": formula_vec,
+        }
+
+
+class TokenizedMLMDataset(Dataset):
+    """Read saved SAFE token IDs in sorted shard order, including BOS and EOS."""
+
+    def __init__(self, parquet_dir, tokenizer, max_len=256, fp_bits=4096, split="train"):
+        from datasets import load_dataset
+
+        root = Path(parquet_dir)
+        files = sorted(str(path) for path in (root / split).glob("shard_*.parquet"))
+        self.data = load_dataset(
+            "parquet", data_files={split: files}, split=split,
+            columns=["input_ids", "fp_indices", "formula_vec"],
+            cache_dir=str(root / "hf_cache"),
+        )
+        self.pad_id = tokenizer.pad_token_id
+        self.max_len = max_len
+        self.fp_bits = fp_bits
+        self.formula_groups = None
+        if split == "train" and (root / "formula_groups.pkl").exists():
+            with (root / "formula_groups.pkl").open("rb") as handle:
+                self.formula_groups = pickle.load(handle)
+            if sum(map(len, self.formula_groups.values())) != len(self.data):
+                raise ValueError("Formula groups must index the tokenized training corpus")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return self.data[int(index)]
+
+    def collate_fn(self, rows):
+        """Pad saved targets to a multiple of eight and mask padding in the loss."""
+        longest = max(len(row["input_ids"]) for row in rows)
+        if longest > self.max_len:
+            raise ValueError("Saved token sequences exceed the configured maximum length")
+        length = min(self.max_len, ((longest + 7) // 8) * 8)
+        ids = torch.full((len(rows), length), self.pad_id, dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        fingerprint = torch.zeros(len(rows), self.fp_bits)
+        for i, row in enumerate(rows):
+            tokens = row["input_ids"]
+            ids[i, :len(tokens)] = torch.tensor(tokens)
+            mask[i, :len(tokens)] = 1
+            fingerprint[i, row["fp_indices"]] = 1
+        labels = ids.clone()
+        labels[mask == 0] = -100
+        return {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "labels": labels,
+            "fingerprint": fingerprint,
+            "formula_vec": torch.tensor([row["formula_vec"] for row in rows], dtype=torch.float32),
         }
 
 

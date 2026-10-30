@@ -1,14 +1,12 @@
-# Released binary assets (kept in the release tree, not version-controlled)
-checkpoints/safe_gpt_base/pytorch_model.bin
-checkpoints/mlm/*.pt
-checkpoints/mist/*.pt
-checkpoints/posterior_aligned_adapters/*/adapter_model.safetensors
-/checkpoints/data_scaling/
+# Local model and dataset assets.
+/checkpoints/
+/data/*
+!/data/exclude_inchikeys.txt
 
-# Released datasets and derived run outputs
-/data/benchmarks/
-/data/pretrain_100m/
-/data/posterior_cache/
+# Derived run outputs
+/output/
+/cache/
+/msgpt_1b/
 eval_results/
 /paper_eval_archive/
 wandb/
@@ -16,6 +14,9 @@ wandb/
 
 # Local env
 .env
+
+# Local experiment assets and source snapshots
+/local_archive/
 
 # Python
 __pycache__/

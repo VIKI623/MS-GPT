@@ -5,8 +5,7 @@ modules that read spectrum-induced posterior queries in the conditional MLM:
 
   - FingerprintEncoder.value_proj         (per-bit value projection)
   - FingerprintEncoder.combine            (combines bit + value embed)
-  - FingerprintEncoder.self_attn.layers.*.linear*   (FP encoder FFN)
-  - cross_attn_layers.*.cross_attn.in_proj_weight   (Q/K/V proj inside MHA)
+  - cross_attn_layers.*.cross_attn.{q,k,v}_proj     (Q/K/V projections)
   - cross_attn_layers.*.cross_attn.out_proj         (MHA output projection)
   - cross_attn_layers.*.ffn.*                       (cross-attn FFN)
   - context_proj                          (final context projection)

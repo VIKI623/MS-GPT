@@ -2,7 +2,7 @@
 
 Input: frozen-MLM candidate JSONL and the aligned posterior-coverage table.
 
-For each spectrum, parse the 100 frozen candidates, compute:
+For each spectrum, parse its frozen candidate pool (100 draws in released profiles), compute:
   frozen_hit_top100 = target InChIKey-14 in the formula-filtered candidate pool
   frozen_hit_top10  = target in the top 10
   frozen_hit_top1   = target ranked first
@@ -19,12 +19,16 @@ Output: target ranks, posterior coverage and recoverability group for each cache
 Usage:
   python scripts/build_recoverability_labels.py \
     --frozen_jsonl eval_results/massspecgym_frozen_train/post.jsonl \
-    --posterior_coverage data/posterior_cache/massspecgym/posterior_coverage_real_train.parquet \
+    --cache_dir data/posterior_cache/mist_official/annotated_top10 --benchmark massspecgym \
+    --posterior_coverage data/posterior_cache/mist_official/annotated_top10/massspecgym/posterior_coverage_real_train.parquet \
+    --threshold_low 0.03112947114434112 --threshold_high 0.7947460954389134 \
     --coverage_threshold 0.40 --workers 48 \
-    --output data/posterior_cache/massspecgym/recoverability_labels.parquet
+    --output eval_results/massspecgym_frozen_train/recoverability_labels.parquet
 """
-import argparse, json
+import argparse
+import json
 from collections import Counter
+from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -34,6 +38,14 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem.inchi import MolToInchi, InchiToInchiKey
 from rdkit.Chem import rdMolDescriptors, AllChem
 from rdkit.DataStructs import ConvertToNumpyArray
+from ms_gpt.pipeline.postprocessing import decode_safe
+from ms_gpt.data.posterior_queries import (
+    BAND_POINTS,
+    band_max_similarity,
+    band_reference_queries,
+    resolve_threshold_band,
+)
+
 RDLogger.DisableLog("rdApp.*")
 
 
@@ -55,48 +67,31 @@ def featurize_candidate(smi):
         return None
 
 
-def tanimoto_similarity(a, b):
-    inter=(a*b).sum(); union=((a+b)>0).sum(); return float(inter/max(union,1))
-
-
-# Density-calibrated band for the band-marginalized tie-break similarity, matching
-# the fidelity-binning analysis: a frequency tie is broken by
-# max_t Tanimoto((posterior > t), candidate) over the density band.
-BAND = {"nplib1": (0.062, 0.292), "massspecgym": (0.069, 0.274)}
-BAND_POINTS = 20
-
-
-def band_reference_queries(posterior, band_low, band_high, num=BAND_POINTS):
-    thresholds = np.linspace(band_low, band_high, num, dtype=np.float32)
-    return posterior[None, :] > thresholds[:, None]
-
-
-def band_max_similarity(queries, query_popcounts, candidate_fp):
-    candidate_bits = candidate_fp > 0
-    intersection = (queries & candidate_bits).sum(1)
-    union = query_popcounts + candidate_bits.sum() - intersection
-    return float(np.max(intersection / np.maximum(union, 1)))
-
-
-def label_spectrum(task):
+def label_spectrum(task, num_reference_queries=BAND_POINTS):
     rec, posterior, band = task
     target_key = rec["target_inchikey14"]
     target_formula = rec.get("target_formula", "")
-    band_queries = band_reference_queries(posterior, band[0], band[1])
+    band_queries = band_reference_queries(posterior, band[0], band[1], num=num_reference_queries)
     band_popcounts = band_queries.sum(1)
-    keys=Counter(); ikfp={}
-    for smi in rec["candidate_smiles"]:
-        r=featurize_candidate(smi)
-        if r is None: continue
-        ik,f,fp=r
-        if target_formula and f != target_formula:
+    keys = Counter()
+    similarities, candidate_scores = {}, {}
+    smiles = (filter(None, map(decode_safe, rec["candidate_safe"]))
+              if "candidate_safe" in rec else rec["candidate_smiles"])
+    for smi in smiles:
+        if smi not in candidate_scores:
+            features = featurize_candidate(smi)
+            score = None
+            if features is not None:
+                key, formula, fp = features
+                if not target_formula or formula == target_formula:
+                    score = (key, band_max_similarity(band_queries, band_popcounts, fp))
+            candidate_scores[smi] = score
+        if candidate_scores[smi] is None:
             continue
-        keys[ik]+=1; ikfp.setdefault(ik,[]).append(fp)
-    cands=[]
-    for k,fr in keys.items():
-        sim=np.mean([band_max_similarity(band_queries,band_popcounts,fp) for fp in ikfp[k]]); cands.append((k,fr,sim))
-    cands.sort(key=lambda x:(-x[1],-x[2]))
-    ranked=[c[0] for c in cands]
+        key, score = candidate_scores[smi]
+        keys[key] += 1
+        similarities.setdefault(key, []).append(score)
+    ranked = sorted(keys, key=lambda key: (-keys[key], -np.mean(similarities[key])))
     hit100 = target_key in keys
     target_rank = ranked.index(target_key) if target_key in ranked else -1
     hit10 = 0 <= target_rank < 10
@@ -112,44 +107,46 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--frozen_jsonl", required=True)
     ap.add_argument("--posterior_coverage", required=True)
-    ap.add_argument("--cache_dir", default="data/posterior_cache")
-    ap.add_argument("--benchmark", choices=("massspecgym","nplib1"), required=True)
-    ap.add_argument("--split", choices=("train","val","test","sim"), default="train")
+    ap.add_argument("--cache_dir", required=True)
+    ap.add_argument("--benchmark", choices=("massspecgym", "nplib1"), required=True)
+    ap.add_argument("--split", choices=("train","val","test"), default="train")
     ap.add_argument("--coverage_threshold", type=float, default=0.40)
     ap.add_argument("--workers", type=int, default=48)
     ap.add_argument("--output", required=True)
+    ap.add_argument("--threshold_low", type=float)
+    ap.add_argument("--threshold_high", type=float)
+    ap.add_argument("--num_reference_queries", type=int, default=BAND_POINTS)
     args=ap.parse_args()
+    try:
+        band = resolve_threshold_band(args.threshold_low, args.threshold_high)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    recs=[]
-    for l in open(args.frozen_jsonl):
-        l=l.strip()
-        if not l: continue
-        try:
-            o=json.loads(l)
-            if isinstance(o,dict) and "cache_row" in o: recs.append(o)
-        except: pass
+    with open(args.frozen_jsonl) as handle:
+        recs = [json.loads(line) for line in handle if line.strip()]
     print(f"{len(recs)} frozen records")
     pi_path = Path(args.cache_dir)/args.benchmark/f"pi_raw_real_{args.split}.npy"
     posterior = np.load(pi_path, mmap_mode="r")
-    band = BAND[args.benchmark]
-    print(f"Band-marginalized tie-break: {args.benchmark} band {band} x{BAND_POINTS}")
-    tasks=[(r, np.asarray(posterior[int(r["cache_row"])], dtype=np.float32), band) for r in recs]
+    print(f"Band-marginalized tie-break: {args.benchmark} band {band} x{args.num_reference_queries}")
+    tasks = ((r, np.asarray(posterior[int(r["cache_row"])], dtype=np.float32), band) for r in recs)
     with Pool(args.workers) as p:
-        rows=p.map(label_spectrum, tasks, chunksize=32)
+        rows = list(p.imap(partial(label_spectrum, num_reference_queries=args.num_reference_queries),
+                           tasks, chunksize=32))
     df=pd.DataFrame(rows)
 
     pdg = pd.read_parquet(args.posterior_coverage)[
         ["cache_row", "posterior_coverage"]
     ]
-    df=df.merge(pdg, on="cache_row", how="left")
-    df["posterior_coverage"]=df["posterior_coverage"].fillna(0.0)
+    df=df.merge(pdg, on="cache_row", how="left", validate="one_to_one")
+    if df["posterior_coverage"].isna().any():
+        raise ValueError("Every candidate row requires coverage from the corresponding posterior cache")
 
-    def assign_recoverability_group(r):
-        if r["frozen_hit_top100"] == 1:
-            return "frozen_hit"
-        return "residual" if r["posterior_coverage"] >= args.coverage_threshold else "low_coverage"
-    df["group"]=df.apply(assign_recoverability_group, axis=1)
+    df["group"] = np.select(
+        [df["frozen_hit_top100"] == 1, df["posterior_coverage"] >= args.coverage_threshold],
+        ["frozen_hit", "residual"], default="low_coverage",
+    )
 
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(args.output, index=False)
     print(f"saved {args.output}  n={len(df)}")
     print("group sizes:\n", df["group"].value_counts())

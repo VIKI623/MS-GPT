@@ -2,20 +2,56 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
 import torch
+import safe
+from rdkit import Chem
+from rdkit.Chem import rdMolDescriptors
 from torch.utils.data import Dataset
 
 from ms_gpt.data.mlm_pretraining_dataset import formula_str_to_vec, smiles_to_safe
 
 
 RECOVERABILITY_WEIGHTS = {
-    "frozen_hit": (0.05, 2.0),
-    "residual": (1.0, 1.0),
-    "low_coverage": (0.0, 0.5),
+    "frozen_hit": (0.0, 1.0),
+    "residual": (2.0, 0.5),
+    "low_coverage": (0.1, 0.25),
 }
+
+
+def encode_posterior_target(smiles, tokenizer, max_len, target_format):
+    """Encode a complete structure with the selected decoder's pretraining rules."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    Chem.RemoveStereochemistry(mol)
+    canonical = Chem.MolToSmiles(mol, isomericSmiles=False)
+    if target_format == "arrow":
+        representation = smiles_to_safe(canonical) or canonical
+    elif target_format == "tokenized_parquet":
+        mol = Chem.MolFromSmiles(canonical)
+        try:
+            representation = safe.encode(canonical, canonical=True, randomize=False, ignore_stereo=True)
+        except safe.SAFEFragmentationError:
+            representation = canonical
+    else:
+        raise ValueError(f"Unknown target format: {target_format}")
+    ids = tokenizer.encode(representation)
+    if target_format == "arrow":
+        ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
+    if len(ids) > max_len or tokenizer.unk_token_id in ids:
+        return None
+    decoded = Chem.MolFromSmiles(safe.decode(representation))
+    if decoded is None:
+        return None
+    Chem.RemoveStereochemistry(decoded)
+    if Chem.MolToSmiles(decoded, isomericSmiles=False) != canonical:
+        return None
+    return (np.asarray(ids, dtype=np.int64), Chem.MolToInchiKey(mol).split("-")[0],
+            rdMolDescriptors.CalcMolFormula(mol))
 
 
 class PosteriorAlignedDataset(Dataset):
@@ -34,6 +70,9 @@ class PosteriorAlignedDataset(Dataset):
         threshold_high: float,
         rng_seed: int = 42,
         group_weights: dict | None = None,
+        gamma: float = 0.4,
+        target_format: str = "arrow",
+        token_file: str | Path | None = None,
     ):
         directory = Path(cache_dir) / benchmark
         tag = f"real_{split}"
@@ -44,36 +83,42 @@ class PosteriorAlignedDataset(Dataset):
         self.rng_seed = int(rng_seed)
         self._worker_rng = None
 
-        labels = pd.read_parquet(recoverability_labels).set_index("cache_row")
+        labels = pd.read_parquet(recoverability_labels).set_index("cache_row").loc[self.meta.cache_row]
+        groups = np.where(labels.frozen_hit_top100.astype(bool), "frozen_hit",
+                          np.where(labels.posterior_coverage >= gamma, "residual", "low_coverage"))
         weights = dict(RECOVERABILITY_WEIGHTS)
         if group_weights:
             weights.update(group_weights)
         self.ce_weights = np.array(
-            [weights[labels.loc[i, "group"]][0] for i in range(len(self.meta))],
+            [weights[group][0] for group in groups],
             dtype=np.float32,
         )
         self.kl_weights = np.array(
-            [weights[labels.loc[i, "group"]][1] for i in range(len(self.meta))],
+            [weights[group][1] for group in groups],
             dtype=np.float32,
         )
 
-        token_path = directory / f"tokens_{tag}.npz"
-        if token_path.exists():
-            token_data = np.load(token_path, allow_pickle=True)
+        if token_file is not None:
+            token_data = np.load(token_file, allow_pickle=True)
             tokens = token_data["tokens"]
             valid = token_data["ok_mask"].astype(bool)
+            if len(tokens) != len(self.meta) or not np.array_equal(token_data["cache_rows"], self.meta.cache_row):
+                raise ValueError("Token rows must match the selected posterior cache")
             self.rows = np.flatnonzero(valid).astype(np.int64)
             self.token_ids = [np.asarray(tokens[i], dtype=np.int64) for i in self.rows]
         else:
-            bos, eos = tokenizer.bos_token_id, tokenizer.eos_token_id
+            targets = {smiles: encode_posterior_target(smiles, tokenizer, max_len, target_format)
+                       for smiles in self.meta.smiles.unique()}
             rows, token_ids = [], []
-            for i, smiles in enumerate(self.meta["smiles"]):
-                safe_string = smiles_to_safe(smiles)
-                if not safe_string:
+            for i, row in enumerate(self.meta.itertuples()):
+                target = targets[row.smiles]
+                if target is None:
                     continue
-                ids = tokenizer.encode(safe_string, add_special_tokens=False)
+                ids, key, formula = target
+                if key != row.inchikey_14 or re.sub(r"[+-]\d*$", "", formula) != re.sub(r"[+-]\d*$", "", row.formula):
+                    continue
                 rows.append(i)
-                token_ids.append(np.asarray([bos] + ids[: max_len - 2] + [eos]))
+                token_ids.append(ids)
             self.rows = np.asarray(rows, dtype=np.int64)
             self.token_ids = token_ids
 
@@ -103,11 +148,11 @@ class PosteriorAlignedDataset(Dataset):
         }
 
 
-def collate_posterior_aligned_batch(batch):
+def collate_posterior_aligned_batch(batch, pad_token_id=0):
     """Pad SAFE targets and stack posterior-derived queries."""
     batch_size = len(batch)
     max_length = max(item["input_ids"].shape[0] for item in batch)
-    input_ids = torch.zeros((batch_size, max_length), dtype=torch.long)
+    input_ids = torch.full((batch_size, max_length), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long)
     labels = torch.full((batch_size, max_length), -100, dtype=torch.long)
     for i, item in enumerate(batch):

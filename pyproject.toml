@@ -9,10 +9,10 @@ description = "MS-GPT: Rethinking MS/MS De Novo Structure Elucidation as Spectru
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
-    "torch>=2.2.0",
-    "transformers>=4.40.0,<5.0.0",
-    "peft>=0.10.0",
-    "safe-mol>=0.1.13",
+    "torch==2.6.0",
+    "transformers==4.57.6",
+    "peft==0.19.1",
+    "safe-mol==0.1.14",
     "datamol",
     "datasets>=2.18.0",
     "rdkit",
@@ -21,6 +21,7 @@ dependencies = [
     "pyarrow>=14.0.0",
     "omegaconf>=2.3.0",
     "tqdm",
+    "joblib",
     "matplotlib>=3.7.0",
     "wandb>=0.13.0",
 ]

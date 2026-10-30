@@ -1,0 +1,23 @@
+{
+  "density_ratio_band": [0.85, 1.25],
+  "benchmarks": {
+    "nplib1": {
+      "max_fragment_peaks": 40,
+      "cache_dir": "data/posterior_cache/mist_frigid_legacy/annotated_top40",
+      "calibration_split": "train",
+      "training_rows": 6810,
+      "true_density_D": 47.065932452276066,
+      "threshold_low": 0.10228091261980378,
+      "threshold_high": 0.38735823218208876
+    },
+    "massspecgym": {
+      "max_fragment_peaks": 40,
+      "cache_dir": "data/posterior_cache/mist_frigid_legacy/annotated_top40",
+      "calibration_split": "train",
+      "training_rows": 194119,
+      "true_density_D": 42.27098841432317,
+      "threshold_low": 0.10374085909282277,
+      "threshold_high": 0.43523832323299766
+    }
+  }
+}

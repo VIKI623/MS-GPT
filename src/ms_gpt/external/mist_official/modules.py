@@ -1,14 +1,25 @@
 """ modules.py"""
-from .spectrum_featurizers import PeakType
 import copy
-import torch
+
 import numpy as np
+import torch
 from torch import nn
-from . import transformer_layer, form_embedders
+
+from . import form_embedders, transformer_layer
+from .chem_utils import ION_LST, max_instr_idx
+
+EPS = 1e-9
 
 
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+def subset_formula_differences(form_diffs: torch.Tensor) -> torch.Tensor:
+    """Keep only elementwise subset/superset differences and take magnitudes."""
+
+    same_sign = torch.all(form_diffs >= 0, dim=-1) | torch.all(
+        form_diffs <= 0, dim=-1
+    )
+    return torch.where(
+        same_sign.unsqueeze(-1), form_diffs.abs(), torch.zeros_like(form_diffs)
+    )
 
 
 class MLPBlocks(nn.Module):
@@ -45,25 +56,34 @@ class FormulaTransformer(nn.Module):
         self,
         hidden_size: int,
         peak_attn_layers: int,
+        set_pooling: str = "intensity",
         spectra_dropout: float = 0.1,
-        pairwise_featurization: bool = True,
+        pairwise_featurization: bool = False,
         num_heads: int = 8,
-        form_embedder: str = "pos-cos",
-        adduct_class_num: int = 11,
-        no_diffs: bool = True,
-        instrument_class_num: int = 0,
-        peak_type_set: str = "reduced",
-        collision_energy_encoder_type: str = "categorical",
+        output_size=2048,
+        form_embedder: str = "float",
+        embed_instrument: bool = False,
+        inten_transform: str = "float",
+        no_diffs: bool = False,
+        **kwargs
     ):
         """_summary_
         Args:
                     hidden_size (int): _description_
                     peak_attn_layers (int): _description_
+                    set_pooling (str, optional): _description_. Defaults to "intensity".
+                        intensity: Weight by intensity of each chem formula
+                        root: Only take the root node
+                        cls: Only take at first class node
+                        mean: Take the mean of all nodes
                     spectra_dropout (float, optional): _description_. Defaults to 0.1.
-                    pairwise_featurization (bool, optional): _description_. Defaults to True.
+                    pairwise_featurization (bool, optional): _description_. Defaults to False.
                     num_heads (int, optional): _description_. Defaults to 8.
                     output_size (int, optional): _description_. Defaults to 2048.
-                    form_embedder (str, optional): _description_. Defaults to "pos-cos".
+                    form_embedder (str, optional): _description_. Defaults to "float".
+                    embed_instrument (bool, optional): _description_. Defaults to False.
+                    inten_transform (str, optional): _description_. Defaults to "float".
+                    no_diffs (str): If true, do not use diff representations
 
                 Raises:
                     ValueError: _description_
@@ -73,48 +93,41 @@ class FormulaTransformer(nn.Module):
         self.attn_heads = num_heads
         self.dim_feedforward = self.hidden_size * 4
         self.spectra_dropout = spectra_dropout
+        self.set_pooling = set_pooling
+        self.output_size = output_size
         self.no_diffs = no_diffs
 
         self.form_embedder = form_embedder
         self.form_embedder_mod = form_embedders.get_embedder(self.form_embedder)
-        
-        self.inten_feats = 1
 
-        # peak type set: "full" = {Frag, LOSS, AB_LOSS, CLS}, "reduced" = {Frag, CLS}
-        if peak_type_set == "full":
-            self.num_types = 4
-            self.cls_type = 3  # CLS index in full enum
+        self.embed_instrument = embed_instrument
+        self.instr_dim = max_instr_idx
+        self.instrument_embedder = nn.Parameter(torch.eye(self.instr_dim))
+
+        self.inten_transform = inten_transform
+        if self.inten_transform in {"float", "zero", "log"}:
+            self.inten_feats = 1
+        elif self.inten_transform == "cat":
+            self.num_inten_bins = 10
+            self.inten_feats = self.num_inten_bins
         else:
-            self.num_types = len(PeakType)
-            self.cls_type = PeakType.CLS.value
+            raise ValueError(f"unknown intensity transform: {self.inten_transform}")
+        self.num_types = 4
+        self.cls_type = 3
 
-        # collision energy: "categorical" includes 4-dim CE features, "sinusoidal" omits
-        self.collision_energy_feats = 0 if collision_energy_encoder_type == "sinusoidal" else 4
+        self.adduct_dim = len(ION_LST) + 1
 
-        self.adduct_dim = adduct_class_num
         self.pairwise_featurization = pairwise_featurization
-        self.instrument_class_num = instrument_class_num
 
         # Define dense encoders and root formula encoder
         self.formula_dim = self.form_embedder_mod.full_dim
-        if self.no_diffs:
-            self.input_dim = (
-                self.formula_dim
-                + self.num_types
-                + self.adduct_dim
-                + self.inten_feats
-                + self.collision_energy_feats
-                + self.instrument_class_num
-            )
-        else:
-            self.input_dim = (
-                self.formula_dim * 2
-                + self.num_types
-                + self.adduct_dim
-                + self.inten_feats
-                + self.collision_energy_feats
-                + self.instrument_class_num
-            )
+        self.input_dim = (
+            self.formula_dim * 2
+            + self.num_types
+            + self.instr_dim
+            + self.inten_feats
+            + self.adduct_dim
+        )
 
         self.intermediate_layer = MLPBlocks(
             input_size=self.input_dim,
@@ -122,7 +135,6 @@ class FormulaTransformer(nn.Module):
             dropout=self.spectra_dropout,
             num_layers=2,
         )
-        
         self.pairwise_featurizer = None
         if self.pairwise_featurization:
             self.pairwise_featurizer = MLPBlocks(
@@ -141,64 +153,64 @@ class FormulaTransformer(nn.Module):
             pairwise_featurization=pairwise_featurization,
         )
         self.peak_attn_layers = _get_clones(peak_attn_layer, peak_attn_layers)
-        
-        types_lookup = nn.functional.one_hot(torch.arange(self.num_types))
-        adducts_lookup = nn.functional.one_hot(torch.arange(self.adduct_dim))
-        self.register_buffer('types_lookup', types_lookup)
-        self.register_buffer('adducts_lookup', adducts_lookup)
-        
-        if self.instrument_class_num > 0:
-            instrument_lookup = nn.functional.one_hot(torch.arange(self.instrument_class_num))
-            self.register_buffer('instrument_lookup', instrument_lookup)
+        self.bin_encoder = None
 
-    def forward(self, batch):
+    def forward(self, batch: dict, return_aux=False):
         """forward."""
         # Step 1: Create embeddings
-        num_peaks = batch["batch_peak_num"]
-        peak_types = batch["batch_peak_type"]
+        num_peaks = batch["num_peaks"]
+        peak_types = batch["types"]
+        instruments = batch["instruments"]
 
+        device = num_peaks.device
+        batch_dim = num_peaks.shape[0]
         peak_dim = peak_types.shape[-1]
-        adducts = batch["batch_peak_adduct"]
+        adducts = batch["ion_vec"]
+
+        cls_token_mask = peak_types == self.cls_type
 
         # Get form vec and get diffs
-        orig_form_vec = batch["batch_peak_formulae_vector"][:, :, :]
+        orig_form_vec = batch["form_vec"][:, :, :]
         form_diffs = orig_form_vec[:, :, None, :] - orig_form_vec[:, None, :, :]
 
         # Embed formulae based upon peak type
-        form_vec = self.form_embedder_mod(orig_form_vec) # (batch_size, peak_num, embedding_dim)
-
-        inten_tensor = batch["batch_peak_intensity"].unsqueeze(-1)
-        one_hot_types = self.types_lookup[peak_types]
-        one_hot_adducts = self.adducts_lookup[adducts]
+        abs_diffs = form_diffs[cls_token_mask]
+        form_vec = self.form_embedder_mod(orig_form_vec)
+        diff_vec = self.form_embedder_mod(abs_diffs)  # .fill_(0)
 
         if self.no_diffs:
-            input_vec = [
-                form_vec,
-                one_hot_types,
-                one_hot_adducts,
-                inten_tensor,
+            diff_vec = diff_vec.fill_(0)
+
+        intens_temp = batch["intens"]
+
+        if self.inten_transform == "cat":
+            inten_tensor = torch.eye(self.num_inten_bins + 1, device=device)[
+                intens_temp.long()
             ]
         else:
-            cls_token_mask = peak_types == self.cls_type
-            abs_diffs = form_diffs[cls_token_mask]
-            diff_vec = self.form_embedder_mod(abs_diffs)
-            input_vec = [
-                form_vec,
-                diff_vec,
-                one_hot_types,
-                one_hot_adducts,
-                inten_tensor,
-            ]
+            inten_tensor = intens_temp[:, :, None]
 
-        if self.collision_energy_feats > 0:
-            collision_energy_tensor = batch["batch_spec_collision_energy"].unsqueeze(1).expand(-1, peak_dim, -1)
-            input_vec.append(collision_energy_tensor)
-            
-        if self.instrument_class_num > 0:
-            instruments = batch["batch_spec_instrument"].unsqueeze(1).expand(-1, peak_dim)
-            one_hot_instruments = self.instrument_lookup[instruments]
-            input_vec.append(one_hot_instruments)
-        
+        one_hot_types = nn.functional.one_hot(peak_types, self.num_types)
+        one_hot_adducts = nn.functional.one_hot(adducts.long(), self.adduct_dim)
+
+        embedded_instruments = self.instrument_embedder[instruments.long()]
+        if self.embed_instrument:
+            embedded_instruments = embedded_instruments[:, None, :].repeat(
+                1, peak_dim, 1
+            )
+        else:
+            embedded_instruments = torch.zeros(batch_dim, peak_dim, self.instr_dim).to(
+                device
+            )
+
+        input_vec = [
+            form_vec,
+            diff_vec,
+            one_hot_types,
+            one_hot_adducts,
+            inten_tensor,
+            embedded_instruments,
+        ]
         input_vec = torch.cat(input_vec, dim=-1)
         peak_tensor = self.intermediate_layer(input_vec)
 
@@ -207,7 +219,7 @@ class FormulaTransformer(nn.Module):
         peak_tensor = peak_tensor.transpose(0, 1)
         # Mask before summing
         peak_dim = peak_tensor.shape[0]
-        peaks_aranged = torch.arange(peak_dim, device=peak_tensor.device)
+        peaks_aranged = torch.arange(peak_dim).to(device)
 
         # batch x num peaks
         attn_mask = ~(peaks_aranged[None, :] < num_peaks[:, None])
@@ -216,22 +228,74 @@ class FormulaTransformer(nn.Module):
             # Make sure to _only_ consider subset fragments, rather than only
             # partial additions/subtractions from across the tree branches
             # Comment out to consider _any_ loss embedding with new parameters
-            same_sign = torch.all(form_diffs >= 0, -1) | torch.all(form_diffs <= 0, -1)
-            form_diffs[~same_sign].fill_(0)
-            form_diffs = torch.abs(form_diffs)
+            form_diffs = subset_formula_differences(form_diffs)
             pairwise_features = self.pairwise_featurizer(
                 self.form_embedder_mod(form_diffs)
             )
 
         # Np x B x d
+        aux_output = {}
         for peak_attn_layer in self.peak_attn_layers:
             peak_tensor, pairwise_features = peak_attn_layer(
                 peak_tensor,
                 pairwise_features=pairwise_features,
                 src_key_padding_mask=attn_mask,
             )
-        
-        return peak_tensor.transpose(0, 1)
+
+        # Step 4: Pool output
+        output, peak_tensor = self._pool_out(
+            peak_tensor, inten_tensor, peak_types, attn_mask, batch_dim
+        )
+        aux_output["peak_tensor"] = peak_tensor.transpose(0, 1)
+
+        # Now convert into output dim
+        if return_aux:
+            output = (output, aux_output)
+
+        return output
+
+    def _pool_out(self, peak_tensor, inten_tensor, peak_types, attn_mask, batch_dim):
+        """_pool_out.
+
+        pool the output of the network
+
+        Return:
+            (output (B x H), peak_tensor : L x B x H)
+
+        """
+
+        #  Np x B x d
+        zero_mask = attn_mask[:, :, None].repeat(1, 1, self.hidden_size).transpose(0, 1)
+
+        # Mask over NaN
+        peak_tensor[zero_mask] = 0
+        # if torch.any(num_peaks == 0).item():
+        #    raise ValueError("Unexpected example with zero peaks")
+        if self.set_pooling == "intensity":
+            inten_tensor = inten_tensor.reshape(batch_dim, -1)
+            intensities_sum = inten_tensor.sum(1).reshape(-1, 1) + EPS
+            inten_tensor = inten_tensor / intensities_sum
+            pool_factor = inten_tensor * ~attn_mask
+        elif self.set_pooling == "mean":
+            inten_tensor = inten_tensor.reshape(batch_dim, -1)
+            pool_factor = torch.clone(inten_tensor).fill_(1)
+            pool_factor = pool_factor * ~attn_mask
+            # Replace all zeros with 1
+            pool_factor[pool_factor == 0] = 1
+            pool_factor = pool_factor / pool_factor.sum(1).reshape(-1, 1)
+        elif self.set_pooling == "root":
+            # Reshape to have batch dim, -1
+            inten_tensor = inten_tensor.reshape(batch_dim, -1)
+            pool_factor = torch.zeros_like(inten_tensor)
+            pool_factor[:, 0] = 1
+        elif self.set_pooling == "cls":
+            pool_factor = (peak_types == self.cls_type).float()
+        else:
+            raise NotImplementedError()
+
+        # Weighted average over peak intensities
+        output = torch.einsum("nbd,bn->bd", peak_tensor, pool_factor)
+        return output, peak_tensor
 
 
 class FPGrowingModule(nn.Module):
@@ -245,11 +309,10 @@ class FPGrowingModule(nn.Module):
 
     def __init__(
         self,
-        hidden_input_dim: int = 512,
+        hidden_input_dim: int = 256,
         final_target_dim: int = 4096,
         num_splits=4,
         reduce_factor=2,
-        spectra_dropout=0.1
     ):
         super().__init__()
 
@@ -268,14 +331,11 @@ class FPGrowingModule(nn.Module):
             for num_split in range(num_splits + 1)
         ][::-1]
 
-        # Start by predicting into the very first layer dim (e.g., 512  -> 512)
+        # Start by predicting into the very first layer dim (e.g., 256  -> 256)
         self.output_dims = layer_dims
 
         # Define initial predict module
         self.initial_predict = nn.Sequential(
-            nn.Linear(hidden_input_dim, hidden_input_dim),
-            nn.ReLU(),
-            nn.Dropout(spectra_dropout),
             nn.Linear(
                 hidden_input_dim,
                 layer_dims[0],
@@ -318,59 +378,5 @@ class FPGrowingModule(nn.Module):
         return output_preds
 
 
-class MistModel(nn.Module):
-    def __init__(self,
-        d_magma_fingerprints = 512,
-        d_fingerprints = 4096,
-        num_fp_growing_predictor_layers = 4,
-        hidden_size: int = 512,
-        peak_attn_layers: int = 2,
-        spectra_dropout: float = 0.1,
-        pairwise_featurization: bool = True,
-        num_heads: int = 8,
-        form_embedder: str = "pos-cos",
-        adduct_class_num: int = 11,
-        no_diffs: bool = True):
-        
-        super().__init__()
-        
-        self.hidden_size = hidden_size
-        
-        self.spec_encoder = FormulaTransformer(
-            hidden_size=hidden_size,
-            peak_attn_layers=peak_attn_layers,
-            spectra_dropout=spectra_dropout,
-            pairwise_featurization=pairwise_featurization,
-            num_heads=num_heads,
-            form_embedder=form_embedder,
-            adduct_class_num=adduct_class_num,
-            no_diffs=no_diffs)
-        
-        self.peak_fingerprints_predictor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(spectra_dropout),
-            nn.Linear(hidden_size, d_magma_fingerprints),
-            nn.Sigmoid()
-        )
-        
-        self.precursor_fingerprints_predictor = FPGrowingModule(
-                hidden_input_dim=hidden_size,
-                final_target_dim=d_fingerprints,
-                num_splits=num_fp_growing_predictor_layers,
-                reduce_factor=2,
-                spectra_dropout=spectra_dropout)
-
-    def forward(self, batch):
-        batch_peak_type = batch["batch_peak_type"]  # (batch_size, max_peak_num)        
-        peak_embeddings = self.spec_encoder(batch) # (batch_size, max_peak_num, d_model)
-        
-        pred_peak_magma_fingerprints = self.peak_fingerprints_predictor(peak_embeddings)
-        
-        cls_peak_peak_embeddings = peak_embeddings[batch_peak_type == PeakType.CLS.value]
-        precursor_fingerprints_multi_layers = self.precursor_fingerprints_predictor(cls_peak_peak_embeddings)
-        
-        return {
-            "pred_growing_fingerprints": precursor_fingerprints_multi_layers,
-            "pred_peak_magma_fingerprints": pred_peak_magma_fingerprints
-        }
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])

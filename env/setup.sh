@@ -12,12 +12,12 @@ conda create -y -n "$ENV_NAME" python=3.10
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
-echo "[2/3] Installing PyTorch (CUDA 12.1 wheel; adjust for your CUDA)"
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+echo "[2/3] Installing PyTorch 2.6.0 (CUDA 12.4 wheel)"
+python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 echo "[3/3] Installing MS-GPT + dependencies"
-pip install -r env/requirements.txt
-pip install -e .
+python -m pip install -r env/requirements.txt
+python -m pip install -e .
 
 echo
 echo "Done. Activate with: conda activate $ENV_NAME"

@@ -19,17 +19,19 @@ class FormulaGroupBatchSampler(Sampler):
       chunked into mixed batches.
 
     All batches from both pools are interleaved randomly each epoch.
-    No data is discarded.
+    Group remainders can join the mixed pool. With ``drop_last=True``, incomplete
+    batches and the final distributed batch remainder are dropped.
     """
 
     def __init__(self, formulas, batch_size, drop_last=True, seed=42,
-                 rank=0, world_size=1):
+                 rank=0, world_size=1, mix_remainders=False):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = seed
         self.epoch = 0
         self.rank = rank
         self.world_size = world_size
+        self.mix_remainders = mix_remainders
 
         if isinstance(formulas, dict):
             formula_to_idx = formulas
@@ -58,6 +60,7 @@ class FormulaGroupBatchSampler(Sampler):
         """Build full batch list (deterministic given rng). All ranks produce the same list."""
         bs = self.batch_size
         all_batches = []
+        mixed_parts = [self.mixed_indices]
 
         for group in self.pure_groups:
             indices = group.copy()
@@ -65,10 +68,13 @@ class FormulaGroupBatchSampler(Sampler):
             for start in range(0, len(indices) - bs + 1, bs):
                 all_batches.append(indices[start:start + bs])
             remainder = len(indices) % bs
-            if remainder and not self.drop_last:
-                all_batches.append(indices[len(indices) - remainder:])
+            if remainder:
+                if self.mix_remainders:
+                    mixed_parts.append(indices[len(indices) - remainder:])
+                elif not self.drop_last:
+                    all_batches.append(indices[len(indices) - remainder:])
 
-        mixed = self.mixed_indices.copy()
+        mixed = np.concatenate(mixed_parts)
         rng.shuffle(mixed)
         for start in range(0, len(mixed) - bs + 1, bs):
             all_batches.append(mixed[start:start + bs])
@@ -92,11 +98,14 @@ class FormulaGroupBatchSampler(Sampler):
     def __len__(self):
         bs = self.batch_size
         n = 0
+        mixed_count = len(self.mixed_indices)
         for g in self.pure_groups:
             n += len(g) // bs
-            if len(g) % bs and not self.drop_last:
+            if self.mix_remainders:
+                mixed_count += len(g) % bs
+            elif len(g) % bs and not self.drop_last:
                 n += 1
-        n += len(self.mixed_indices) // bs
-        if len(self.mixed_indices) % bs and not self.drop_last:
+        n += mixed_count // bs
+        if mixed_count % bs and not self.drop_last:
             n += 1
         return n // self.world_size

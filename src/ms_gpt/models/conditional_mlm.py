@@ -284,6 +284,14 @@ class ConditionalMoleculeLanguageModel(nn.Module):
     Injects cross-attention after every N transformer blocks.
     """
 
+    @classmethod
+    def from_config(cls, config, vocab_size, *, dropout=None):
+        """Build from the model section of a pretraining configuration."""
+        parameters = dict(config.model)
+        if dropout is not None:
+            parameters["dropout"] = dropout
+        return cls(vocab_size=vocab_size, **parameters)
+
     def __init__(
         self,
         vocab_size: int = 1882,
